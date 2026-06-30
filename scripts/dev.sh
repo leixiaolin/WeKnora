@@ -370,6 +370,23 @@ start_app() {
       export CGO_LDFLAGS="-Wl,-no_warn_duplicate_libraries"
     fi
 
+    # Windows 下 sqlite-vec 的 cgo 包 #include "sqlite3.h"，但 Windows 没有系统级 SQLite
+    # 开发包（Linux/macOS 通常自带）。复用项目已依赖的 mattn/go-sqlite3 自带的 amalgamation
+    # （sqlite3-binding.h 内容等同官方 sqlite3.h），复制为 sqlite3.h 并加入 CGO include 路径。
+    if [[ "$(uname)" == MINGW* ]]; then
+      mattn_dir=$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3 2>/dev/null)
+      if [[ -n "$mattn_dir" && -f "$mattn_dir/sqlite3-binding.h" ]]; then
+        sqlite_h_dir="$PROJECT_ROOT/.build/sqlite-headers"
+        mkdir -p "$sqlite_h_dir"
+        cp "$mattn_dir/sqlite3-binding.h" "$sqlite_h_dir/sqlite3.h"
+        sqlite_h_dir_win=$(cygpath -m "$sqlite_h_dir" 2>/dev/null || echo "$sqlite_h_dir")
+        export CGO_CFLAGS="$CGO_CFLAGS -I$sqlite_h_dir_win"
+        log_info "Windows: 已复用 mattn/go-sqlite3 amalgamation 作为 sqlite3.h (→ $sqlite_h_dir)"
+      else
+        log_warning "Windows: 未定位到 mattn/go-sqlite3/sqlite3-binding.h，sqlite-vec 编译可能报 sqlite3.h not found"
+      fi
+    fi
+
     # 检查是否安装了 Air（热重载工具）
     if command -v air &> /dev/null; then
         log_success "检测到 Air，使用热重载模式启动..."
