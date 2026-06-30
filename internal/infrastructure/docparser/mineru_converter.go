@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,21 +82,11 @@ func (c *MinerUReader) Read(ctx context.Context, req *types.ReadRequest) (*types
 	return &types.ReadResult{
 		MarkdownContent: mdContent,
 		ImageRefs:       imageRefs,
+		Metadata: map[string]string{
+			"parser_engine":  "mineru",
+			"mineru_backend": c.backend,
+		},
 	}, nil
-}
-
-// mineruFileParseResponse mirrors the relevant fields from the MinerU API response.
-type mineruFileParseResponse struct {
-	Results struct {
-		Document struct {
-			MDContent string            `json:"md_content"`
-			Images    map[string]string `json:"images"` // path -> "data:image/png;base64,..." or raw base64
-		} `json:"document"`
-		Files struct {
-			MDContent string            `json:"md_content"`
-			Images    map[string]string `json:"images"` // path -> "data:image/png;base64,..." or raw base64
-		} `json:"files"`
-	} `json:"results"`
 }
 
 func (c *MinerUReader) callFileParse(ctx context.Context, content []byte) (string, map[string]string, error) {
@@ -163,40 +154,76 @@ func (c *MinerUReader) callFileParse(ctx context.Context, content []byte) (strin
 		return "", nil, fmt.Errorf("read response body: %w", err)
 	}
 
-	// Dump raw response for debugging (truncate if too large)
-	rawStr := string(respBody)
-	if len(rawStr) > 4000 {
-		logger.Infof(context.Background(), "[MinerU] Raw response (truncated to 4000 chars): %s ...", rawStr[:4000])
-	} else {
-		logger.Infof(context.Background(), "[MinerU] Raw response: %s", rawStr)
-	}
-
-	// Also pretty-print the top-level structure (without large base64 blobs)
+	// Log structure only. MinerU responses may contain document text and base64
+	// image payloads; dumping raw bodies is noisy and risks leaking content.
 	var rawMap map[string]interface{}
 	if err := json.Unmarshal(respBody, &rawMap); err == nil {
 		c.logMinerUResponseStructure(rawMap, "")
 	}
 
-	var result mineruFileParseResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", nil, fmt.Errorf("decode response: %w", err)
+	mdContent, images, source, err := extractMinerUFileParseResult(respBody)
+	if err != nil {
+		return "", nil, err
+	}
+	logger.Infof(context.Background(), "[MinerU] Using response path: %s", source)
+	return mdContent, images, nil
+}
+
+type mineruDocumentResult struct {
+	MDContent string            `json:"md_content"`
+	Images    map[string]string `json:"images"` // path -> "data:image/png;base64,..." or raw base64
+}
+
+func extractMinerUFileParseResult(respBody []byte) (string, map[string]string, string, error) {
+	var envelope struct {
+		Results json.RawMessage `json:"results"`
+	}
+	if err := json.Unmarshal(respBody, &envelope); err != nil {
+		return "", nil, "", fmt.Errorf("decode response: %w", err)
+	}
+	if len(envelope.Results) == 0 || string(envelope.Results) == "null" {
+		return "", nil, "", fmt.Errorf("MinerU API response missing results")
 	}
 
-	// MinerU response schema differs by version/deployment:
-	// - older/self-hosted variants: results.document.*
-	// - some variants:            results.files.*
-	// Prefer document when available, then fallback to files.
-	if result.Results.Document.MDContent != "" || len(result.Results.Document.Images) > 0 {
-		logger.Infof(context.Background(), "[MinerU] Using response path: results.document")
-		return result.Results.Document.MDContent, result.Results.Document.Images, nil
-	}
-	if result.Results.Files.MDContent != "" || len(result.Results.Files.Images) > 0 {
-		logger.Infof(context.Background(), "[MinerU] Using response path: results.files")
-		return result.Results.Files.MDContent, result.Results.Files.Images, nil
+	if doc, ok := decodeMinerUDocument(envelope.Results); ok {
+		return doc.MDContent, doc.Images, "results", nil
 	}
 
-	logger.Errorf(context.Background(), "[MinerU] Response has no markdown/images under results.document or results.files")
-	return "", nil, nil
+	var results map[string]json.RawMessage
+	if err := json.Unmarshal(envelope.Results, &results); err != nil {
+		return "", nil, "", fmt.Errorf("decode results: %w", err)
+	}
+
+	for _, key := range []string{"document", "files"} {
+		if raw, ok := results[key]; ok {
+			if doc, ok := decodeMinerUDocument(raw); ok {
+				return doc.MDContent, doc.Images, "results." + key, nil
+			}
+		}
+	}
+
+	keys := make([]string, 0, len(results))
+	for key := range results {
+		if key != "document" && key != "files" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if doc, ok := decodeMinerUDocument(results[key]); ok {
+			return doc.MDContent, doc.Images, "results." + key, nil
+		}
+	}
+
+	return "", nil, "", fmt.Errorf("MinerU API returned no markdown/images in results")
+}
+
+func decodeMinerUDocument(raw json.RawMessage) (mineruDocumentResult, bool) {
+	var doc mineruDocumentResult
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return doc, false
+	}
+	return doc, doc.MDContent != "" || len(doc.Images) > 0
 }
 
 // processImages decodes base64 images from MinerU response and returns ImageRef list.

@@ -90,11 +90,16 @@ func (c *MinerUCloudReader) Read(ctx context.Context, req *types.ReadRequest) (*
 		return nil, fmt.Errorf("MinerU Cloud poll: %w", err)
 	}
 
+	mdContent = normalizeMinerUMarkdown(mdContent)
 	mdContent, imageRefs = ensureOriginalImageRef(req, mdContent, imageRefs)
 
 	return &types.ReadResult{
 		MarkdownContent: mdContent,
 		ImageRefs:       imageRefs,
+		Metadata: map[string]string{
+			"parser_engine": "mineru_cloud",
+			"mineru_model":  c.model,
+		},
 	}, nil
 }
 
@@ -295,15 +300,7 @@ func (c *MinerUCloudReader) fetchBatchStatus(ctx context.Context, batchID string
 		return nil, nil
 	}
 
-	// Dump the raw extract_result JSON for debugging
-	rawExtract := string(pollResp.Data.ExtractResult)
-	if len(rawExtract) > 4000 {
-		logger.Infof(context.Background(), "[MinerUCloud] Raw extract_result (truncated to 4000 chars): %s ...", rawExtract[:4000])
-	} else {
-		logger.Infof(context.Background(), "[MinerUCloud] Raw extract_result: %s", rawExtract)
-	}
-
-	// Pretty-print the structure to reveal all available fields
+	// Log structure only. Cloud extract results may include document text.
 	var rawObj interface{}
 	if err := json.Unmarshal(pollResp.Data.ExtractResult, &rawObj); err == nil {
 		logResponseStructure("MinerUCloud", rawObj, "extract_result")

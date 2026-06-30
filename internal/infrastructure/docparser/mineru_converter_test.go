@@ -1,9 +1,12 @@
 package docparser
 
 import (
+	"context"
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
 func TestNormalizeMinerUMarkdownPreservesMarkdownAndHTML(t *testing.T) {
@@ -65,25 +68,110 @@ func TestProcessImagesKeepsReferencedVariants(t *testing.T) {
 	}
 }
 
-// TestProcessImagesMatchesPathsWithSpaces guards against a regression where
-// MinerU image filenames containing spaces (common on Chinese documents,
-// e.g. "images/第 1 页.jpg") would be silently dropped because the markdown
-// regex used to extract refs disallowed whitespace inside the URL group.
 func TestProcessImagesMatchesPathsWithSpaces(t *testing.T) {
 	reader := &MinerUReader{}
-	mdContent := "![](images/第 1 页.jpg)"
+	mdContent := "![](images/page 1.jpg)"
 
 	png := createTestPNG(200, 150)
 	b64 := base64.StdEncoding.EncodeToString(png)
 	images := map[string]string{
-		"第 1 页.jpg": "data:image/png;base64," + b64,
+		"page 1.jpg": "data:image/png;base64," + b64,
 	}
 
 	refs, _ := reader.processImages(mdContent, images)
 	if len(refs) != 1 {
 		t.Fatalf("expected 1 image ref for path with spaces, got %d", len(refs))
 	}
-	if refs[0].OriginalRef != "images/第 1 页.jpg" {
+	if refs[0].OriginalRef != "images/page 1.jpg" {
 		t.Fatalf("unexpected OriginalRef: %q", refs[0].OriginalRef)
+	}
+}
+
+func TestProcessImagesMatchesUnicodePaths(t *testing.T) {
+	reader := &MinerUReader{}
+	mdContent := "![](images/第1页 图表.png)"
+
+	png := createTestPNG(200, 150)
+	b64 := base64.StdEncoding.EncodeToString(png)
+	images := map[string]string{
+		"第1页 图表.png": "data:image/png;base64," + b64,
+	}
+
+	refs, _ := reader.processImages(mdContent, images)
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 image ref for unicode path, got %d", len(refs))
+	}
+	if refs[0].OriginalRef != "images/第1页 图表.png" {
+		t.Fatalf("unexpected OriginalRef: %q", refs[0].OriginalRef)
+	}
+}
+
+func TestMinerUReadRequiresEndpoint(t *testing.T) {
+	reader := NewMinerUReader(nil)
+
+	result, err := reader.Read(context.Background(), &types.ReadRequest{
+		FileName:    "sample.pdf",
+		FileType:    "pdf",
+		FileContent: []byte("%PDF-1.7"),
+	})
+
+	if err != nil {
+		t.Fatalf("Read returned unexpected error: %v", err)
+	}
+	if result == nil || !strings.Contains(result.Error, "MinerU endpoint is not configured") {
+		t.Fatalf("expected diagnostic endpoint error, got %#v", result)
+	}
+}
+
+func TestMinerUCloudReadRequiresAPIKey(t *testing.T) {
+	reader := NewMinerUCloudReader(nil)
+
+	result, err := reader.Read(context.Background(), &types.ReadRequest{
+		FileName:    "sample.pdf",
+		FileType:    "pdf",
+		FileContent: []byte("%PDF-1.7"),
+	})
+
+	if err != nil {
+		t.Fatalf("Read returned unexpected error: %v", err)
+	}
+	if result == nil || !strings.Contains(result.Error, "MinerU Cloud API key is not configured") {
+		t.Fatalf("expected diagnostic API key error, got %#v", result)
+	}
+}
+
+func TestExtractMinerUFileParseResultSupportsNamedResults(t *testing.T) {
+	body := []byte(`{
+		"results": {
+			"sample.pdf": {
+				"md_content": "# Title\n\n![](images/page 1.png)",
+				"images": {
+					"images/page 1.png": "data:image/png;base64,AA=="
+				}
+			}
+		}
+	}`)
+
+	md, images, source, err := extractMinerUFileParseResult(body)
+	if err != nil {
+		t.Fatalf("extractMinerUFileParseResult returned error: %v", err)
+	}
+	if md != "# Title\n\n![](images/page 1.png)" {
+		t.Fatalf("unexpected markdown: %q", md)
+	}
+	if images["images/page 1.png"] != "data:image/png;base64,AA==" {
+		t.Fatalf("unexpected images: %#v", images)
+	}
+	if source != "results.sample.pdf" {
+		t.Fatalf("unexpected source: %s", source)
+	}
+}
+
+func TestExtractMinerUFileParseResultFailsOnEmptyResult(t *testing.T) {
+	body := []byte(`{"results":{"document":{}}}`)
+
+	_, _, _, err := extractMinerUFileParseResult(body)
+	if err == nil || !strings.Contains(err.Error(), "no markdown/images") {
+		t.Fatalf("expected empty result error, got %v", err)
 	}
 }

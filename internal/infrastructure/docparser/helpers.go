@@ -79,7 +79,9 @@ func logResponseStructure(label string, obj interface{}, prefix string) {
 					}
 				}
 			case string:
-				if len(inner) > 200 {
+				if shouldRedactLoggedString(path, inner) {
+					logger.Infof(context.Background(), "[%s] %s = string(%d chars): <redacted>", label, path, len(inner))
+				} else if len(inner) > 200 {
 					logger.Infof(context.Background(), "[%s] %s = string(%d chars): %.200s...", label, path, len(inner), inner)
 				} else {
 					logger.Infof(context.Background(), "[%s] %s = %q", label, path, inner)
@@ -109,4 +111,29 @@ func logResponseStructure(label string, obj interface{}, prefix string) {
 	default:
 		logger.Infof(context.Background(), "[%s] %s = %v (%T)", label, prefix, v, v)
 	}
+}
+
+func shouldRedactLoggedString(path, value string) bool {
+	lowerPath := strings.ToLower(path)
+	for _, marker := range []string{
+		"md_content", "markdown", "content", "text", "images.", "image_data", "api_key", "token", "secret",
+	} {
+		if strings.Contains(lowerPath, marker) {
+			return true
+		}
+	}
+	if strings.HasPrefix(value, "data:image/") {
+		return true
+	}
+	if len(value) < 512 {
+		return false
+	}
+	base64Chars := 0
+	for _, r := range value {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			r == '+' || r == '/' || r == '=' || r == '-' || r == '_' || r == '\n' || r == '\r' {
+			base64Chars++
+		}
+	}
+	return base64Chars*100/len(value) > 95
 }
