@@ -362,6 +362,9 @@ start_app() {
     log_info "环境变量已设置，启动应用..."
     log_info "数据库地址: $DB_HOST:${DB_PORT:-5432}"
     
+    # duckdb + sqlite-vec 都是 CGO 库，必须启用 CGO 并依赖宿主机的 C 编译器（gcc/clang）。
+    # Windows 用户需先装 MinGW-w64 / TDM-GCC；macOS 需 Xcode Command Line Tools。
+    export CGO_ENABLED=1
     export CGO_CFLAGS="-Wno-deprecated-declarations -Wno-gnu-folding-constant"
     if [[ "$(uname)" == "Darwin" ]]; then
       export CGO_LDFLAGS="-Wl,-no_warn_duplicate_libraries"
