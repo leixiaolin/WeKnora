@@ -1,0 +1,15 @@
+<svg width="512" height="160" viewBox="0 0 512 160" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="jnu-lxl">
+  <rect x="8" y="8" width="496" height="144" rx="34" fill="#FFFFFF"/>
+  <rect x="9.5" y="9.5" width="493" height="141" rx="32.5" stroke="#0F172A" stroke-opacity="0.08" stroke-width="3"/>
+  <rect x="34" y="38" width="84" height="84" rx="24" fill="url(#badgeGradient)"/>
+  <path d="M72 56H90V92.5C90 107.1 80.7 115 66.6 115C58.7 115 51.7 112.8 46.7 108.9L54 94.6C57.4 97.2 61.3 98.7 65.1 98.7C69.7 98.7 72 96.4 72 91.3V56Z" fill="white"/>
+  <path d="M106 47C125.7 49.8 139.8 60.3 145.5 74.1C151.5 88.8 147 105.4 132.6 118.8" stroke="#14B8A6" stroke-width="8" stroke-linecap="round"/>
+  <path d="M38 128C64.3 110.4 98.7 105.1 132 113.2C148.5 117.3 163.8 124.7 177.4 135" stroke="#2563EB" stroke-width="7" stroke-linecap="round"/>
+  <text x="150" y="102" fill="#111827" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="62" font-weight="760" letter-spacing="0">jnu-lxl</text>
+  <defs>
+    <linearGradient id="badgeGradient" x1="34" y1="38" x2="118" y2="122" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+</svg>
