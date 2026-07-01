@@ -5,16 +5,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
 	"io"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
+	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
+	"github.com/xuri/excelize/v2"
 )
 
 var dataAnalysisTool = BaseTool{
@@ -116,13 +118,15 @@ type DataAnalysisTool struct {
 	db                   *sql.DB
 	sessionID            string
 	createdTables        []string // Track tables created in this session
+	queryCache           map[string]*types.ToolResult
+	queryCacheMu         sync.Mutex
 	// localBaseDir is the LOCAL_STORAGE_BASE_DIR value captured at construction
 	// time so resolveFileServiceForKnowledge uses the same base path that was
 	// used when the local FileService was initialised by DI.  Re-reading the
 	// env var at request time can produce a different (or empty) value if the
 	// variable was not exported to the sub-process or was set programmatically
 	// after startup, causing GetFile to look in the wrong directory (#1040).
-	localBaseDir         string
+	localBaseDir string
 }
 
 func NewDataAnalysisTool(
@@ -141,11 +145,12 @@ func NewDataAnalysisTool(
 		tenantService:        tenantService,
 		db:                   db,
 		sessionID:            sessionID,
+		queryCache:           make(map[string]*types.ToolResult),
 		// Capture LOCAL_STORAGE_BASE_DIR once at construction time so that every
 		// call to resolveFileServiceForKnowledge uses the same base path.  The
 		// env var is guaranteed to be set (or empty == "/data/files" fallback)
 		// when the application starts and the DI container is assembled.
-		localBaseDir:         strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR")),
+		localBaseDir: strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR")),
 	}
 }
 
@@ -194,6 +199,10 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 			Success: false,
 			Error:   fmt.Sprintf("Failed to parse input args: %v", err),
 		}, err
+	}
+	if cached := t.getCachedQueryResult(input); cached != nil {
+		logger.Infof(ctx, "[Tool][DataAnalysis] Duplicate query hit cache for session %s", t.sessionID)
+		return cached, nil
 	}
 
 	schema, err := t.LoadFromKnowledgeID(ctx, input.KnowledgeID)
@@ -262,7 +271,7 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 
 	queryOutput := t.formatQueryResults(results, input.Sql)
 	logger.Infof(ctx, "[Tool][DataAnalysis] Completed execution query, total %d rows for session %s", len(results), t.sessionID)
-	return &types.ToolResult{
+	result := &types.ToolResult{
 		Success: true,
 		Output:  queryOutput,
 		Data: map[string]interface{}{
@@ -272,7 +281,53 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 			"display_type": ToolDataAnalysis,
 			"session_id":   t.sessionID,
 		},
-	}, nil
+	}
+	t.storeQueryResult(input, result)
+	return cloneToolResult(result), nil
+}
+
+func (t *DataAnalysisTool) queryCacheKey(input DataAnalysisInput) string {
+	return strings.TrimSpace(input.KnowledgeID) + "\x00" + strings.Join(strings.Fields(input.Sql), " ")
+}
+
+func (t *DataAnalysisTool) getCachedQueryResult(input DataAnalysisInput) *types.ToolResult {
+	t.queryCacheMu.Lock()
+	defer t.queryCacheMu.Unlock()
+	result := t.queryCache[t.queryCacheKey(input)]
+	if result == nil {
+		return nil
+	}
+	clone := cloneToolResult(result)
+	clone.Output = "This exact data_analysis query has already been executed in this turn. " +
+		"Use the cached result below to answer the user now; do not call data_analysis again with the same SQL.\n\n" +
+		clone.Output
+	return clone
+}
+
+func (t *DataAnalysisTool) storeQueryResult(input DataAnalysisInput, result *types.ToolResult) {
+	t.queryCacheMu.Lock()
+	defer t.queryCacheMu.Unlock()
+	if t.queryCache == nil {
+		t.queryCache = make(map[string]*types.ToolResult)
+	}
+	t.queryCache[t.queryCacheKey(input)] = cloneToolResult(result)
+}
+
+func cloneToolResult(result *types.ToolResult) *types.ToolResult {
+	if result == nil {
+		return nil
+	}
+	clone := *result
+	if result.Data != nil {
+		clone.Data = make(map[string]interface{}, len(result.Data))
+		for k, v := range result.Data {
+			clone.Data[k] = v
+		}
+	}
+	if result.Images != nil {
+		clone.Images = append([]string(nil), result.Images...)
+	}
+	return &clone
 }
 
 // executeSingleQuery executes a single SQL query and returns columns and results
@@ -465,14 +520,33 @@ func (t *DataAnalysisTool) LoadFromExcel(ctx context.Context, filename string, t
 	return t.LoadFromTable(ctx, tableName)
 }
 
-// listExcelSheets returns the names of every sheet (layer) inside the given
-// Excel workbook by querying DuckDB's spatial st_read_meta table function.
+// listExcelSheets returns the names of every sheet inside the given Excel workbook.
 // The returned slice preserves the on-disk order of sheets.
 //
-// st_read_meta returns a single row whose `layers` column is a LIST of
-// STRUCTs (one per layer / sheet). We UNNEST that list and project the
-// struct's `name` field to get a flat list of sheet names.
+// Prefer excelize so sheet enumeration does not depend on DuckDB's spatial
+// extension. If excelize cannot open the file (for example legacy .xls), fall
+// back to DuckDB's st_read_meta when available.
 func (t *DataAnalysisTool) listExcelSheets(ctx context.Context, filename string) ([]string, error) {
+	if f, err := excelize.OpenFile(filename); err == nil {
+		defer func() { _ = f.Close() }()
+		names := make([]string, 0, len(f.GetSheetList()))
+		for _, name := range f.GetSheetList() {
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			names = append(names, name)
+		}
+		if len(names) > 0 {
+			return names, nil
+		}
+	} else {
+		logger.Warnf(ctx, "[Tool][DataAnalysis] excelize could not enumerate sheets for '%s': %v", filename, err)
+	}
+
+	if t.db == nil {
+		return nil, fmt.Errorf("failed to enumerate Excel sheets and DuckDB is unavailable")
+	}
+
 	metaSQL := fmt.Sprintf(
 		"SELECT UNNEST(layers).name FROM st_read_meta('%s')",
 		sqlSingleQuoteEscape(filename),

@@ -83,6 +83,35 @@ func writeWorkbook(t *testing.T, path string, sheets map[string][][]any, sheetOr
 	}
 }
 
+func TestListExcelSheets_UsesWorkbookMetadataWithoutDuckDB(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "multi_sheet.xlsx")
+
+	writeWorkbook(t, path,
+		map[string][][]any{
+			"拟录取": {
+				{"id", "major"},
+				{1, "计算机技术"},
+			},
+			"调剂": {
+				{"id", "major"},
+				{2, "软件工程"},
+			},
+		},
+		[]string{"拟录取", "调剂"},
+	)
+
+	tool := &DataAnalysisTool{sessionID: "test-list-sheets"}
+	got, err := tool.listExcelSheets(context.Background(), path)
+	if err != nil {
+		t.Fatalf("listExcelSheets: %v", err)
+	}
+	want := []string{"拟录取", "调剂"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("sheet order mismatch: got %v, want %v", got, want)
+	}
+}
+
 // TestLoadFromExcel_MultiSheet is the end-to-end guard for issue #1007:
 // given a workbook with 2 sheets of different schemas, every row from every
 // sheet must land in the DuckDB table, and the __sheet_name column must

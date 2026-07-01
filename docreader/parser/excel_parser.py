@@ -8,7 +8,7 @@ sheets and handles various Excel formats using pandas.
 import logging
 import re
 from io import BytesIO
-from typing import List
+from typing import List, Tuple
 
 import pandas as pd
 
@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 _IMAGE_FUNC_RE = re.compile(
     r"^=?(_xlfn\.)?(DISPIMG|IMAGE)\(", re.IGNORECASE
 )
+_HEADER_KEYWORD_RE = re.compile(
+    r"(序号|编号|代码|姓名|名称|学院|专业|方向|类别|类型|成绩|分数|备注|"
+    r"考生|录取|拟录取|准考证|身份证|电话|邮箱|时间|日期|状态)"
+)
 
 
 def _is_image_function(value: object) -> bool:
@@ -40,6 +44,65 @@ def _is_image_function(value: object) -> bool:
     if not isinstance(value, str):
         return False
     return _IMAGE_FUNC_RE.match(value) is not None
+
+
+def _cell_text(value: object) -> str:
+    if pd.isna(value) or _is_image_function(value):
+        return ""
+    return str(value).strip()
+
+
+def _looks_numeric(value: str) -> bool:
+    if value == "":
+        return False
+    return re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value) is not None
+
+
+def _infer_header_labels(df: pd.DataFrame) -> Tuple[dict[object, str], int]:
+    """Infer semantic column labels while keeping positional A/B/C columns.
+
+    Many XLSX files put a merged title row before the real header row. Pandas
+    with header=None preserves all rows, which is good for recall, but row
+    chunks then only say "A/B/C" and lose labels like "拟录取专业". This helper
+    finds a likely header row and lets later data rows carry both forms.
+    """
+    best_score = 0
+    best_labels: dict[object, str] = {}
+    best_row_idx = -1
+    max_scan_rows = min(len(df), 20)
+
+    for row_idx in range(max_scan_rows):
+        row = df.iloc[row_idx]
+        values = [_cell_text(v) for v in row.tolist()]
+        non_empty = [v for v in values if v]
+        distinct = {v for v in non_empty}
+        if len(non_empty) < 2 or len(distinct) < 2:
+            continue
+
+        numeric_count = sum(1 for v in non_empty if _looks_numeric(v))
+        keyword_count = sum(1 for v in non_empty if _HEADER_KEYWORD_RE.search(v))
+        short_text_count = sum(1 for v in non_empty if len(v) <= 24 and not _looks_numeric(v))
+
+        # Header rows are usually compact text labels. Requiring at least one
+        # domain-ish keyword avoids treating ordinary first data rows as headers.
+        if keyword_count == 0 or short_text_count < 2:
+            continue
+        if numeric_count > len(non_empty) / 2:
+            continue
+
+        score = keyword_count * 3 + short_text_count - numeric_count
+        if score <= best_score:
+            continue
+
+        labels = {}
+        for col, value in zip(df.columns, values):
+            if value:
+                labels[col] = value
+        best_score = score
+        best_labels = labels
+        best_row_idx = row_idx
+
+    return best_labels, best_row_idx
 
 
 class ExcelParser(BaseParser):
@@ -92,14 +155,20 @@ class ExcelParser(BaseParser):
             df = _read_sheet_dataframe(excel_file, excel_sheet_name)
             # Remove rows where all values are NaN (completely empty rows)
             df.dropna(how="all", inplace=True)
+            header_labels, header_row_idx = _infer_header_labels(df)
 
             # Process each row in the DataFrame
-            for _, row in df.iterrows():
+            for row_pos, (_, row) in enumerate(df.iterrows()):
                 page_content = []
                 # Build key-value pairs for non-null values
                 for k, v in row.items():
                     if pd.notna(v) and not _is_image_function(v):
-                        page_content.append(f"{k}: {v}")
+                        value = str(v)
+                        label = header_labels.get(k, "") if row_pos > header_row_idx else ""
+                        if label and label != value.strip():
+                            page_content.append(f"{k}: {value} [列名: {label}]")
+                        else:
+                            page_content.append(f"{k}: {value}")
                 
                 # Skip rows with no valid content
                 if not page_content:

@@ -281,6 +281,40 @@ class ExcelParserTest(unittest.TestCase):
         self.assertIn("42", document.content)
         self.assertGreater(len(document.chunks), 0)
 
+    def test_xlsx_rows_include_inferred_semantic_column_labels(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "2026年信息学院内招硕士研究生拟录取名单"
+        ws.merge_cells("A1:D1")
+        ws.append(["考生编号", "姓名", "拟录取专业", "专业代码"])
+        ws.append(["1001", "张三", "计算机技术", "085404"])
+        bio = io.BytesIO()
+        wb.save(bio)
+
+        document = ExcelParser().parse_into_text(bio.getvalue())
+
+        self.assertIn("C: 计算机技术 [列名: 拟录取专业]", document.content)
+        self.assertIn("D: 085404 [列名: 专业代码]", document.content)
+        self.assertIn("A: 1001 [列名: 考生编号]", document.content)
+
+    def test_parse_all_xlsx_sheets(self):
+        wb = openpyxl.Workbook()
+        first = wb.active
+        first.title = "第一志愿"
+        first.append(["考生编号", "姓名", "拟录取专业"])
+        first.append(["1001", "张三", "计算机技术"])
+        second = wb.create_sheet("调剂")
+        second.append(["考生编号", "姓名", "拟录取专业"])
+        second.append(["2001", "李四", "软件工程"])
+        bio = io.BytesIO()
+        wb.save(bio)
+
+        document = ExcelParser().parse_into_text(bio.getvalue())
+
+        self.assertIn("C: 计算机技术 [列名: 拟录取专业]", document.content)
+        self.assertIn("C: 软件工程 [列名: 拟录取专业]", document.content)
+        self.assertEqual(len(document.chunks), 4)
+
     def test_parse_en_calcchain_shared_strings_case(self):
         path = os.path.join(
             os.path.dirname(__file__),

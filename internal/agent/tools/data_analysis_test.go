@@ -3,6 +3,8 @@ package tools
 import (
 	"strings"
 	"testing"
+
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
 func TestBuildExcelCreateTableSQL_NoSheets(t *testing.T) {
@@ -75,16 +77,78 @@ func TestBuildExcelCreateTableSQL_EscapesSingleQuotes(t *testing.T) {
 
 func TestSqlSingleQuoteEscape(t *testing.T) {
 	cases := map[string]string{
-		"":              "",
-		"no_quote":      "no_quote",
-		"a'b":           "a''b",
-		"''":            "''''",
-		"mix'ed'quote":  "mix''ed''quote",
+		"":               "",
+		"no_quote":       "no_quote",
+		"a'b":            "a''b",
+		"''":             "''''",
+		"mix'ed'quote":   "mix''ed''quote",
 		"中文 with 'quote": "中文 with ''quote",
 	}
 	for in, want := range cases {
 		if got := sqlSingleQuoteEscape(in); got != want {
 			t.Errorf("sqlSingleQuoteEscape(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestDataAnalysisDuplicateQueryCacheReturnsGuidance(t *testing.T) {
+	tool := &DataAnalysisTool{queryCache: make(map[string]*types.ToolResult)}
+	input := DataAnalysisInput{
+		KnowledgeID: "knowledge-1",
+		Sql:         "SELECT COUNT(*) FROM table_1",
+	}
+	tool.storeQueryResult(input, &types.ToolResult{
+		Success: true,
+		Output:  "Returned 1 rows\nrecord 1: {\"count\":3}",
+		Data: map[string]interface{}{
+			"display_type": ToolDataAnalysis,
+			"row_count":    1,
+		},
+	})
+
+	got := tool.getCachedQueryResult(DataAnalysisInput{
+		KnowledgeID: "knowledge-1",
+		Sql:         "SELECT   COUNT(*)   FROM   table_1",
+	})
+
+	if got == nil {
+		t.Fatal("expected cached result")
+	}
+	if !strings.Contains(got.Output, "already been executed") {
+		t.Fatalf("expected duplicate-call guidance, got: %s", got.Output)
+	}
+	if !strings.Contains(got.Output, "record 1") {
+		t.Fatalf("expected cached rows to remain visible, got: %s", got.Output)
+	}
+}
+
+func TestCompactToolOutputForHistory_DataAnalysisIncludesResultSummary(t *testing.T) {
+	result := &types.ToolResult{
+		Success: true,
+		Data: map[string]interface{}{
+			"display_type": ToolDataAnalysis,
+			"query":        "SELECT COUNT(*) AS total FROM table_1",
+			"row_count":    1,
+			"rows": []map[string]string{
+				{"total": "3"},
+			},
+		},
+	}
+
+	got := CompactToolOutputForHistory(ToolDataAnalysis, result)
+
+	for _, want := range []string{
+		"Data analysis returned 1 row(s)",
+		"SELECT COUNT(*) AS total FROM table_1",
+		"Sample rows:",
+		"total",
+		"3",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in compact output:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "payload omitted from history") {
+		t.Fatalf("data_analysis history must not collapse to generic omitted marker:\n%s", got)
 	}
 }

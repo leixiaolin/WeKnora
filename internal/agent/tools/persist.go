@@ -122,6 +122,17 @@ func compactToolSummary(success bool, errMsg string, data map[string]interface{}
 		return "Error: tool call failed"
 	}
 	switch stringField(data, "display_type") {
+	case ToolDataAnalysis:
+		rowCount := intField(data, "row_count")
+		query := stringField(data, "query")
+		summary := fmt.Sprintf("Data analysis returned %d row(s)", rowCount)
+		if query != "" {
+			summary += fmt.Sprintf(" for SQL: %s", query)
+		}
+		if sample := compactDataAnalysisRows(data, 3); sample != "" {
+			summary += "\n" + sample
+		}
+		return summary
 	case "knowledge_chunks_list":
 		title := stringField(data, "knowledge_title")
 		if title == "" {
@@ -160,6 +171,50 @@ func compactToolSummary(success bool, errMsg string, data map[string]interface{}
 		return fmt.Sprintf("Tool completed (%s; payload omitted from history)", displayType)
 	}
 	return "Tool completed (payload omitted from history)"
+}
+
+func compactDataAnalysisRows(data map[string]interface{}, limit int) string {
+	if data == nil || limit <= 0 {
+		return ""
+	}
+	rows, ok := data["rows"]
+	if !ok || rows == nil {
+		return ""
+	}
+
+	items, ok := rows.([]interface{})
+	if !ok {
+		switch typed := rows.(type) {
+		case []map[string]string:
+			items = make([]interface{}, 0, len(typed))
+			for _, row := range typed {
+				items = append(items, row)
+			}
+		case []map[string]interface{}:
+			items = make([]interface{}, 0, len(typed))
+			for _, row := range typed {
+				items = append(items, row)
+			}
+		default:
+			return ""
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("Sample rows:")
+	for i, item := range items {
+		if i >= limit {
+			break
+		}
+		b.WriteString(fmt.Sprintf("\nrecord %d: %v", i+1, item))
+	}
+	if len(items) > limit {
+		b.WriteString(fmt.Sprintf("\n... %d more row(s)", len(items)-limit))
+	}
+	return b.String()
 }
 
 func stringField(data map[string]interface{}, key string) string {
