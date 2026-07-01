@@ -60,6 +60,7 @@ docker compose down                                       # 停止
 > **为什么需要 GCC？** 后端依赖 `duckdb` 和 `sqlite-vec`，两者都是 CGO 库，编译时必须 `CGO_ENABLED=1` 且宿主机要有 C 编译器。没装 gcc 会报 `build constraints exclude all Go files in .../duckdb-go-bindings/lib/windows-amd64`。`scripts/dev.sh app` 已经自动 `export CGO_ENABLED=1`，但 gcc 需要你自己装。
 >
 > **装 gcc（任选其一）**：
+>
 > - **WinLibs（推荐）**：从 [winlibs.com](https://winlibs.com/) 下载 UCRT 版 ZIP，解压到 `C:\mingw64`，把 `C:\mingw64\bin` 加到系统 PATH。验证：新开 Git Bash 跑 `gcc --version`。
 > - **TDM-GCC**：从 [jmeubank.github.io/tdm-gcc](https://jmeubank.github.io/tdm-gcc/) 下载安装器，一键装、自动配 PATH。
 > - **Scoop / Chocolatey**：`scoop install gcc` 或 `choco install mingw`。
