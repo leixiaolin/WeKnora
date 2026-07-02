@@ -121,7 +121,7 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	logger.Debugf(ctx, "[Agent][Thinking] Iteration-%d: temp=%.2f, tools=%d, thinking=%v",
 		iteration+1, e.config.Temperature, len(tools), e.config.Thinking)
 
-	parallelToolCalls := true
+	parallelToolCalls := allowModelParallelToolCalls(tools)
 	opts := &chat.ChatOptions{
 		Temperature:       e.config.Temperature,
 		Tools:             tools,
@@ -451,4 +451,27 @@ func (e *AgentEngine) callLLMWithRetry(
 	}
 
 	return response, nil
+}
+
+func allowModelParallelToolCalls(tools []chat.Tool) bool {
+	hasDataAnalysis := false
+	hasNonDataAnalysisTool := false
+	for _, tool := range tools {
+		name := tool.Function.Name
+		switch name {
+		case agenttools.ToolDataAnalysis, agenttools.ToolDataSchema:
+			if name == agenttools.ToolDataAnalysis {
+				hasDataAnalysis = true
+			}
+		default:
+			hasNonDataAnalysisTool = true
+		}
+	}
+
+	// Data-analysis agents work best as a schema call followed by one
+	// deliberate SQL query. Allowing the model to emit multiple speculative SQL
+	// calls in one response caused noisy 6-round/30-tool-call traces. Keep the
+	// historical default for general-purpose agents and only narrow this
+	// table-analysis toolset.
+	return !hasDataAnalysis || hasNonDataAnalysisTool
 }

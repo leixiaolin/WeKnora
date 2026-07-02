@@ -3,13 +3,16 @@ package tools
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -29,7 +32,16 @@ var dataAnalysisTool = BaseTool{
 
 // excelSheetNameColumn is the name of the synthetic column that identifies
 // which Excel sheet a row came from when multiple sheets are unioned together.
-const excelSheetNameColumn = "__sheet_name"
+const (
+	excelSheetNameColumn = "__sheet_name"
+	excelRowNumberColumn = "__row_number"
+)
+
+const (
+	excelHeaderScanRows      = 40
+	excelHeaderMinConfidence = 3.0
+	excelMaxSampleRows       = 3
+)
 
 // sqlSingleQuoteEscape escapes single quotes in a string so it can be safely
 // embedded inside a single-quoted SQL literal.
@@ -102,6 +114,419 @@ func buildMissingColumnSuggestion(sqlErr error, schema *TableSchema) string {
 	}
 
 	return ""
+}
+
+type excelSheetDiagnostic struct {
+	Name       string   `json:"name"`
+	HeaderRow  int      `json:"header_row"`
+	DataRows   int      `json:"data_rows"`
+	Columns    []string `json:"columns"`
+	SampleRows []string `json:"sample_rows,omitempty"`
+	Confidence float64  `json:"confidence"`
+	Normalized bool     `json:"normalized"`
+	SkipReason string   `json:"skip_reason,omitempty"`
+}
+
+type normalizedExcelSheet struct {
+	diagnostic excelSheetDiagnostic
+	columns    []string
+	rows       []normalizedExcelRow
+}
+
+type normalizedExcelRow struct {
+	rowNumber int
+	values    map[string]string
+}
+
+type inferredExcelHeader struct {
+	rowIndex    int
+	confidence  float64
+	dataStart   int
+	activeWidth int
+}
+
+var excelHeaderKeywords = []string{
+	"编号", "姓名", "名称", "专业", "代码", "成绩", "日期", "时间", "状态", "类别",
+	"类型", "金额", "数量", "分数", "排名", "备注", "学院", "院系", "方式", "序号",
+	"id", "name", "code", "date", "time", "status", "type", "amount",
+	"count", "score", "rank", "category", "major", "no", "number",
+}
+
+func trimExcelCell(s string) string {
+	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+}
+
+func excelRowNonEmptyCount(row []string, width int) int {
+	count := 0
+	for i := 0; i < width && i < len(row); i++ {
+		if trimExcelCell(row[i]) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func excelRowLastNonEmptyIndex(row []string) int {
+	for i := len(row) - 1; i >= 0; i-- {
+		if trimExcelCell(row[i]) != "" {
+			return i
+		}
+	}
+	return -1
+}
+
+func excelRowsMaxWidth(rows [][]string) int {
+	width := 0
+	for _, row := range rows {
+		if len(row) > width {
+			width = len(row)
+		}
+	}
+	return width
+}
+
+func isExcelNumericLike(s string) bool {
+	s = strings.TrimSpace(strings.ReplaceAll(s, ",", ""))
+	if s == "" {
+		return false
+	}
+	s = strings.TrimSuffix(s, "%")
+	if s == "" {
+		return false
+	}
+	_, err := strconv.ParseFloat(s, 64)
+	return err == nil
+}
+
+func isExcelTextLike(s string) bool {
+	s = trimExcelCell(s)
+	if s == "" || isExcelNumericLike(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func excelHeaderKeywordHits(row []string) int {
+	hits := 0
+	seen := make(map[string]bool)
+	for _, cell := range row {
+		text := strings.ToLower(trimExcelCell(cell))
+		if text == "" {
+			continue
+		}
+		for _, keyword := range excelHeaderKeywords {
+			if strings.Contains(text, keyword) && !seen[keyword] {
+				hits++
+				seen[keyword] = true
+			}
+		}
+	}
+	return hits
+}
+
+func scoreExcelHeaderCandidate(rows [][]string, rowIndex, width int) (float64, int) {
+	row := rows[rowIndex]
+	nonEmpty := excelRowNonEmptyCount(row, width)
+	if width == 0 || nonEmpty < 2 {
+		return 0, 0
+	}
+
+	unique := make(map[string]bool)
+	textCount := 0
+	numericCount := 0
+	lastHeaderCell := excelRowLastNonEmptyIndex(row)
+	for i := 0; i < width && i < len(row); i++ {
+		cell := trimExcelCell(row[i])
+		if cell == "" {
+			continue
+		}
+		unique[normalizeIdentifierForMatch(cell)] = true
+		if isExcelTextLike(cell) {
+			textCount++
+		}
+		if isExcelNumericLike(cell) {
+			numericCount++
+		}
+	}
+	if lastHeaderCell < 0 {
+		return 0, 0
+	}
+
+	fillRatio := float64(nonEmpty) / float64(width)
+	uniqueRatio := float64(len(unique)) / float64(nonEmpty)
+	textRatio := float64(textCount) / float64(nonEmpty)
+	score := fillRatio*2 + uniqueRatio*1.5 + textRatio
+
+	if numericCount == nonEmpty {
+		score -= 3
+	}
+	if hits := excelHeaderKeywordHits(row); hits > 0 {
+		if hits > 5 {
+			hits = 5
+		}
+		score += float64(hits) * 1.1
+	}
+	if rowIndex > 0 && excelRowNonEmptyCount(rows[rowIndex-1], width) == 1 && nonEmpty >= 2 {
+		score += 2
+	}
+
+	dataRows := 0
+	dataShapeBonus := 0.0
+	maxDataCell := lastHeaderCell
+	for i := rowIndex + 1; i < len(rows) && dataRows < 5; i++ {
+		if last := excelRowLastNonEmptyIndex(rows[i]); last > maxDataCell {
+			maxDataCell = last
+		}
+		nextNonEmpty := excelRowNonEmptyCount(rows[i], lastHeaderCell+1)
+		if nextNonEmpty == 0 {
+			continue
+		}
+		dataRows++
+		if nextNonEmpty >= maxInt(1, nonEmpty/2) {
+			dataShapeBonus += 0.4
+		}
+	}
+	if dataRows > 0 {
+		score += 1.5 + dataShapeBonus
+	}
+
+	return score, maxDataCell + 1
+}
+
+func inferExcelHeader(rows [][]string) (inferredExcelHeader, bool) {
+	width := excelRowsMaxWidth(rows)
+	if width == 0 {
+		return inferredExcelHeader{}, false
+	}
+
+	best := inferredExcelHeader{rowIndex: -1}
+	limit := len(rows)
+	if limit > excelHeaderScanRows {
+		limit = excelHeaderScanRows
+	}
+	for i := 0; i < limit; i++ {
+		score, activeWidth := scoreExcelHeaderCandidate(rows, i, width)
+		if score > best.confidence {
+			best = inferredExcelHeader{
+				rowIndex:    i,
+				confidence:  score,
+				dataStart:   i + 1,
+				activeWidth: activeWidth,
+			}
+		}
+	}
+	if best.rowIndex < 0 || best.confidence < excelHeaderMinConfidence || best.activeWidth == 0 {
+		return inferredExcelHeader{}, false
+	}
+	return best, true
+}
+
+func normalizeExcelColumns(header []string, width int) []string {
+	columns := make([]string, 0, width)
+	used := make(map[string]int)
+	for i := 0; i < width; i++ {
+		name := ""
+		if i < len(header) {
+			name = trimExcelCell(header[i])
+		}
+		if name == "" {
+			name = fmt.Sprintf("column_%d", i+1)
+		}
+		if normalizeIdentifierForMatch(name) == excelSheetNameColumn ||
+			normalizeIdentifierForMatch(name) == excelRowNumberColumn {
+			name = name + "_value"
+		}
+
+		key := normalizeIdentifierForMatch(name)
+		used[key]++
+		if used[key] > 1 {
+			name = fmt.Sprintf("%s__%d", name, used[key])
+		}
+		columns = append(columns, name)
+	}
+	return columns
+}
+
+func normalizeExcelSheet(f *excelize.File, sheetName string) (*normalizedExcelSheet, error) {
+	rows, err := f.GetRows(sheetName, excelize.Options{RawCellValue: true})
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 || excelRowsMaxWidth(rows) == 0 {
+		return &normalizedExcelSheet{
+			diagnostic: excelSheetDiagnostic{
+				Name:       sheetName,
+				Normalized: false,
+				SkipReason: "empty sheet",
+			},
+		}, nil
+	}
+
+	header, ok := inferExcelHeader(rows)
+	if !ok {
+		return nil, fmt.Errorf("could not confidently infer header row for sheet %q", sheetName)
+	}
+
+	columns := normalizeExcelColumns(rows[header.rowIndex], header.activeWidth)
+	sheet := &normalizedExcelSheet{
+		columns: columns,
+		diagnostic: excelSheetDiagnostic{
+			Name:       sheetName,
+			HeaderRow:  header.rowIndex + 1,
+			Columns:    append([]string(nil), columns...),
+			Confidence: header.confidence,
+			Normalized: true,
+		},
+	}
+
+	for rowIndex := header.dataStart; rowIndex < len(rows); rowIndex++ {
+		row := rows[rowIndex]
+		if excelRowNonEmptyCount(row, header.activeWidth) == 0 {
+			continue
+		}
+		values := make(map[string]string, len(columns))
+		sampleParts := make([]string, 0, len(columns))
+		for colIndex, colName := range columns {
+			value := ""
+			if colIndex < len(row) {
+				value = trimExcelCell(row[colIndex])
+			}
+			values[colName] = value
+			if len(sheet.diagnostic.SampleRows) < excelMaxSampleRows && value != "" {
+				sampleParts = append(sampleParts, fmt.Sprintf("%s=%s", colName, value))
+			}
+		}
+		sheet.rows = append(sheet.rows, normalizedExcelRow{
+			rowNumber: rowIndex + 1,
+			values:    values,
+		})
+		if len(sheet.diagnostic.SampleRows) < excelMaxSampleRows && len(sampleParts) > 0 {
+			sheet.diagnostic.SampleRows = append(sheet.diagnostic.SampleRows, strings.Join(sampleParts, ", "))
+		}
+	}
+	sheet.diagnostic.DataRows = len(sheet.rows)
+	return sheet, nil
+}
+
+func normalizeExcelWorkbook(filename string) ([]normalizedExcelSheet, []string, []excelSheetDiagnostic, error) {
+	f, err := excelize.OpenFile(filename)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	globalColumns := make([]string, 0)
+	seenColumns := make(map[string]bool)
+	sheets := make([]normalizedExcelSheet, 0)
+	diagnostics := make([]excelSheetDiagnostic, 0)
+	for _, sheetName := range f.GetSheetList() {
+		if strings.TrimSpace(sheetName) == "" {
+			continue
+		}
+		sheet, err := normalizeExcelSheet(f, sheetName)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		diagnostics = append(diagnostics, sheet.diagnostic)
+		if !sheet.diagnostic.Normalized {
+			continue
+		}
+		sheets = append(sheets, *sheet)
+		for _, col := range sheet.columns {
+			key := normalizeIdentifierForMatch(col)
+			if seenColumns[key] {
+				continue
+			}
+			seenColumns[key] = true
+			globalColumns = append(globalColumns, col)
+		}
+	}
+	if len(sheets) == 0 || len(globalColumns) == 0 {
+		return nil, nil, diagnostics, fmt.Errorf("no non-empty Excel sheets could be normalized")
+	}
+	return sheets, globalColumns, diagnostics, nil
+}
+
+func writeNormalizedExcelCSV(sheets []normalizedExcelSheet, globalColumns []string) (string, func(), error) {
+	file, err := os.CreateTemp("", "weknora-excel-*.csv")
+	if err != nil {
+		return "", nil, err
+	}
+	path := file.Name()
+	cleanup := func() { _ = os.Remove(path) }
+
+	writer := csv.NewWriter(file)
+	header := append([]string{}, globalColumns...)
+	header = append(header, excelSheetNameColumn, excelRowNumberColumn)
+	if err := writer.Write(header); err != nil {
+		_ = file.Close()
+		cleanup()
+		return "", nil, err
+	}
+
+	for _, sheet := range sheets {
+		for _, row := range sheet.rows {
+			record := make([]string, 0, len(header))
+			for _, col := range globalColumns {
+				record = append(record, row.values[col])
+			}
+			record = append(record, sheet.diagnostic.Name, strconv.Itoa(row.rowNumber))
+			if err := writer.Write(record); err != nil {
+				_ = file.Close()
+				cleanup()
+				return "", nil, err
+			}
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		_ = file.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+func createNormalizedExcelTable(ctx context.Context, db *sql.DB, filename, tableName string) ([]excelSheetDiagnostic, error) {
+	if db == nil {
+		return nil, fmt.Errorf("duckdb connection is unavailable")
+	}
+	sheets, globalColumns, diagnostics, err := normalizeExcelWorkbook(filename)
+	if err != nil {
+		return diagnostics, err
+	}
+
+	csvPath, cleanup, err := writeNormalizedExcelCSV(sheets, globalColumns)
+	if err != nil {
+		return diagnostics, err
+	}
+	defer cleanup()
+
+	createTableSQL := fmt.Sprintf(
+		"CREATE TABLE \"%s\" AS SELECT * FROM read_csv_auto('%s', header=true, all_varchar=true)",
+		tableName,
+		sqlSingleQuoteEscape(csvPath),
+	)
+	if _, err := db.ExecContext(ctx, createTableSQL); err != nil {
+		return diagnostics, err
+	}
+	return diagnostics, nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 type DataAnalysisInput struct {
@@ -270,16 +695,20 @@ func (t *DataAnalysisTool) Execute(ctx context.Context, args json.RawMessage) (*
 	}
 
 	queryOutput := t.formatQueryResults(results, input.Sql)
+	if diagnostics := schema.excelDiagnosticsDescription(); diagnostics != "" {
+		queryOutput += "\n" + diagnostics
+	}
 	logger.Infof(ctx, "[Tool][DataAnalysis] Completed execution query, total %d rows for session %s", len(results), t.sessionID)
 	result := &types.ToolResult{
 		Success: true,
 		Output:  queryOutput,
 		Data: map[string]interface{}{
-			"rows":         results,
-			"row_count":    len(results),
-			"query":        input.Sql,
-			"display_type": ToolDataAnalysis,
-			"session_id":   t.sessionID,
+			"rows":               results,
+			"row_count":          len(results),
+			"query":              input.Sql,
+			"display_type":       ToolDataAnalysis,
+			"session_id":         t.sessionID,
+			"schema_diagnostics": schema.Metadata,
 		},
 	}
 	t.storeQueryResult(input, result)
@@ -473,11 +902,11 @@ func (t *DataAnalysisTool) LoadFromCSV(ctx context.Context, filename string, tab
 
 // LoadFromExcel loads data from an Excel file into a DuckDB table and returns the table schema.
 //
-// Multi-sheet workbooks are fully supported: every sheet in the workbook is
-// loaded and the rows from all sheets are unioned (UNION ALL BY NAME) into a
-// single table. A synthetic '__sheet_name' column is added so downstream SQL
-// can filter / aggregate per sheet. If sheet enumeration fails for any
-// reason, we fall back to reading just the first sheet (original behavior).
+// Multi-sheet .xlsx workbooks are normalized through excelize before loading:
+// the tool infers each sheet's real header row, skips title/instruction rows,
+// adds __sheet_name and __row_number, then loads a temporary CSV into DuckDB.
+// If normalization is not possible (for example legacy .xls or ambiguous
+// sheets), the tool falls back to the original DuckDB read_xlsx path.
 //
 // Parameters:
 //   - ctx: context for cancellation and timeout
@@ -488,36 +917,66 @@ func (t *DataAnalysisTool) LoadFromCSV(ctx context.Context, filename string, tab
 //   - *TableSchema: schema information of the created table
 //   - error: any error that occurred during the operation
 //
-// Note: requires the DuckDB 'excel' extension (for read_xlsx) and the
-// 'spatial' extension (for st_read_meta used to enumerate sheets).
+// Note: the normalized .xlsx path only requires DuckDB CSV support. The
+// fallback path still requires DuckDB's excel/spatial extensions.
 func (t *DataAnalysisTool) LoadFromExcel(ctx context.Context, filename string, tableName string) (*TableSchema, error) {
 	logger.Infof(ctx, "[Tool][DataAnalysis] Loading Excel file '%s' into table '%s' for session %s", filename, tableName, t.sessionID)
 
+	var diagnostics []excelSheetDiagnostic
+	normalized := false
+
 	// Record the created table for cleanup. If already exists, skip creation.
 	if t.recordCreatedTable(tableName) {
-		sheetNames, enumErr := t.listExcelSheets(ctx, filename)
-		if enumErr != nil {
+		if smartDiagnostics, err := createNormalizedExcelTable(ctx, t.db, filename, tableName); err == nil {
+			diagnostics = smartDiagnostics
+			normalized = true
+			logger.Infof(ctx,
+				"[Tool][DataAnalysis] Successfully created normalized table '%s' from Excel file in session %s (sheets=%d)",
+				tableName, t.sessionID, len(diagnostics),
+			)
+		} else {
 			logger.Warnf(ctx,
-				"[Tool][DataAnalysis] Could not enumerate sheets for '%s' (session=%s): %v. Falling back to first sheet only.",
-				filename, t.sessionID, enumErr,
+				"[Tool][DataAnalysis] Smart Excel normalization failed for '%s' (session=%s): %v. Falling back to DuckDB read_xlsx.",
+				filename, t.sessionID, err,
+			)
+			diagnostics = smartDiagnostics
+			sheetNames, enumErr := t.listExcelSheets(ctx, filename)
+			if enumErr != nil {
+				logger.Warnf(ctx,
+					"[Tool][DataAnalysis] Could not enumerate sheets for '%s' (session=%s): %v. Falling back to first sheet only.",
+					filename, t.sessionID, enumErr,
+				)
+			}
+
+			createTableSQL := buildExcelCreateTableSQL(tableName, filename, sheetNames)
+
+			if _, err := t.db.ExecContext(ctx, createTableSQL); err != nil {
+				logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to create table from Excel (sheets=%v): %v", sheetNames, err)
+				return nil, fmt.Errorf("failed to create table from Excel file (sheets=%v): %w", sheetNames, err)
+			}
+
+			logger.Infof(ctx,
+				"[Tool][DataAnalysis] Successfully created fallback table '%s' from Excel file in session %s (sheets=%v)",
+				tableName, t.sessionID, sheetNames,
 			)
 		}
-
-		createTableSQL := buildExcelCreateTableSQL(tableName, filename, sheetNames)
-
-		if _, err := t.db.ExecContext(ctx, createTableSQL); err != nil {
-			logger.Errorf(ctx, "[Tool][DataAnalysis] Failed to create table from Excel (sheets=%v): %v", sheetNames, err)
-			return nil, fmt.Errorf("failed to create table from Excel file (sheets=%v): %w", sheetNames, err)
-		}
-
-		logger.Infof(ctx,
-			"[Tool][DataAnalysis] Successfully created table '%s' from Excel file in session %s (sheets=%v)",
-			tableName, t.sessionID, sheetNames,
-		)
 	}
 
-	// Get and return the table schema
-	return t.LoadFromTable(ctx, tableName)
+	schema, err := t.LoadFromTable(ctx, tableName)
+	if err != nil {
+		return nil, err
+	}
+	if schema.Metadata == nil {
+		schema.Metadata = make(map[string]interface{})
+	}
+	if len(diagnostics) > 0 {
+		schema.Metadata["excel_sheets"] = diagnostics
+	}
+	schema.Metadata["excel_normalized"] = normalized
+	if !normalized {
+		schema.Metadata["excel_normalization_warning"] = "Excel header inference was not used; schema may reflect the first row instead of the real header."
+	}
+	return schema, nil
 }
 
 // listExcelSheets returns the names of every sheet inside the given Excel workbook.
@@ -826,8 +1285,55 @@ func (t *TableSchema) Description() string {
 	for _, col := range t.Columns {
 		builder.WriteString(fmt.Sprintf("- %s (%s)\n", col.Name, col.Type))
 	}
+	if diagnostics := t.excelDiagnosticsDescription(); diagnostics != "" {
+		builder.WriteString("\n")
+		builder.WriteString(diagnostics)
+	}
 
 	return builder.String()
+}
+
+func (t *TableSchema) excelDiagnosticsDescription() string {
+	if t == nil || len(t.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := t.Metadata["excel_sheets"]
+	if !ok {
+		return ""
+	}
+	diagnostics, ok := raw.([]excelSheetDiagnostic)
+	if !ok || len(diagnostics) == 0 {
+		return ""
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Excel schema diagnostics:\n")
+	if normalized, _ := t.Metadata["excel_normalized"].(bool); normalized {
+		builder.WriteString("- Header rows were inferred automatically. Use these exact column names in SQL.\n")
+	} else if warning, _ := t.Metadata["excel_normalization_warning"].(string); warning != "" {
+		builder.WriteString("- ")
+		builder.WriteString(warning)
+		builder.WriteString("\n")
+	}
+	for _, diag := range diagnostics {
+		if !diag.Normalized {
+			if diag.SkipReason != "" {
+				builder.WriteString(fmt.Sprintf("- Sheet %q skipped: %s\n", diag.Name, diag.SkipReason))
+			}
+			continue
+		}
+		builder.WriteString(fmt.Sprintf(
+			"- Sheet %q: header row %d, data rows %d, columns: %s\n",
+			diag.Name,
+			diag.HeaderRow,
+			diag.DataRows,
+			strings.Join(diag.Columns, ", "),
+		))
+		for _, sample := range diag.SampleRows {
+			builder.WriteString(fmt.Sprintf("  sample: %s\n", sample))
+		}
+	}
+	return strings.TrimRight(builder.String(), "\n")
 }
 
 // resolveFileServiceForKnowledge resolves a provider-specific FileService based on the knowledge file path.

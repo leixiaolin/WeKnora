@@ -23,15 +23,6 @@ func newTestDuckDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	ctx := context.Background()
-	for _, ext := range []string{"spatial", "excel"} {
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
-			t.Skipf("cannot install duckdb %s extension (network required): %v", ext, err)
-		}
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("LOAD %s;", ext)); err != nil {
-			t.Skipf("cannot load duckdb %s extension: %v", ext, err)
-		}
-	}
 	return db
 }
 
@@ -308,5 +299,150 @@ func TestLoadFromExcel_QuotedSheetName(t *testing.T) {
 	}
 	if got != sheet {
 		t.Errorf("sheet-name roundtrip mismatch: got %q, want %q", got, sheet)
+	}
+}
+
+func TestLoadFromExcel_InferHeaderAfterTitleRowAndCountMajor(t *testing.T) {
+	db := newTestDuckDB(t)
+
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "admission.xlsx")
+
+	colCandidateID := "\u8003\u751f\u7f16\u53f7"
+	colName := "\u8003\u751f\u59d3\u540d"
+	colMajorCode := "\u4e13\u4e1a\u4ee3\u7801"
+	colMajor := "\u62df\u5f55\u53d6\u4e13\u4e1a"
+	computerTech := "\u8ba1\u7b97\u673a\u6280\u672f"
+	ai := "\u4eba\u5de5\u667a\u80fd"
+
+	rows := [][]any{
+		{"010 information school 2026 admission list", nil, nil, nil},
+		{colCandidateID, colName, colMajorCode, colMajor},
+	}
+	for i := 0; i < 57; i++ {
+		rows = append(rows, []any{fmt.Sprintf("10559610559%04d", i), fmt.Sprintf("student-%02d", i), "085404", computerTech})
+	}
+	rows = append(rows,
+		[]any{"105596105599901", "other-1", "085410", ai},
+		[]any{"105596105599902", "other-2", "085410", ai},
+	)
+
+	writeWorkbook(t, path,
+		map[string][][]any{
+			"sheet1": rows,
+		},
+		[]string{"sheet1"},
+	)
+
+	tool := &DataAnalysisTool{
+		BaseTool:  dataAnalysisTool,
+		db:        db,
+		sessionID: "test-title-row",
+	}
+
+	ctx := context.Background()
+	schema, err := tool.LoadFromExcel(ctx, path, "t_admission")
+	if err != nil {
+		t.Fatalf("LoadFromExcel: %v", err)
+	}
+	t.Cleanup(func() { tool.Cleanup(ctx) })
+
+	colSet := map[string]bool{}
+	for _, c := range schema.Columns {
+		colSet[c.Name] = true
+	}
+	if !colSet[colMajor] {
+		t.Fatalf("expected inferred business column %q, got columns=%v", colMajor, schema.Columns)
+	}
+	if colSet["010 information school 2026 admission list"] {
+		t.Fatalf("title row must not become a queryable column: %v", schema.Columns)
+	}
+
+	var count int
+	sqlText := fmt.Sprintf(`SELECT COUNT(*) FROM "t_admission" WHERE "%s" = '%s'`, colMajor, computerTech)
+	if err := db.QueryRowContext(ctx, sqlText).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 57 {
+		t.Fatalf("computer technology count = %d, want 57", count)
+	}
+
+	diagnostics, ok := schema.Metadata["excel_sheets"].([]excelSheetDiagnostic)
+	if !ok || len(diagnostics) != 1 {
+		t.Fatalf("expected one excel diagnostic, got %#v", schema.Metadata["excel_sheets"])
+	}
+	if diagnostics[0].HeaderRow != 2 {
+		t.Fatalf("header row = %d, want 2 (diagnostic=%+v)", diagnostics[0].HeaderRow, diagnostics[0])
+	}
+}
+
+func TestLoadFromExcel_NormalizesDuplicateAndBlankColumns(t *testing.T) {
+	db := newTestDuckDB(t)
+
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "duplicate_columns.xlsx")
+
+	writeWorkbook(t, path,
+		map[string][][]any{
+			"Data": {
+				{"name", "name", ""},
+				{"primary", "alias", "note"},
+			},
+		},
+		[]string{"Data"},
+	)
+
+	tool := &DataAnalysisTool{
+		BaseTool:  dataAnalysisTool,
+		db:        db,
+		sessionID: "test-duplicate-columns",
+	}
+
+	ctx := context.Background()
+	schema, err := tool.LoadFromExcel(ctx, path, "t_duplicate_columns")
+	if err != nil {
+		t.Fatalf("LoadFromExcel: %v", err)
+	}
+	t.Cleanup(func() { tool.Cleanup(ctx) })
+
+	colSet := map[string]bool{}
+	for _, c := range schema.Columns {
+		colSet[c.Name] = true
+	}
+	for _, want := range []string{"name", "name__2", "column_3", excelSheetNameColumn, excelRowNumberColumn} {
+		if !colSet[want] {
+			t.Fatalf("expected column %q in schema columns=%v", want, schema.Columns)
+		}
+	}
+
+	var alias, note string
+	if err := db.QueryRowContext(ctx,
+		`SELECT "name__2", "column_3" FROM "t_duplicate_columns" LIMIT 1`,
+	).Scan(&alias, &note); err != nil {
+		t.Fatalf("query normalized columns: %v", err)
+	}
+	if alias != "alias" || note != "note" {
+		t.Fatalf("unexpected normalized values: alias=%q note=%q", alias, note)
+	}
+}
+
+func TestNormalizeExcelWorkbook_AmbiguousRowsFailSafely(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "ambiguous.xlsx")
+
+	writeWorkbook(t, path,
+		map[string][][]any{
+			"Data": {
+				{1, 2, 3},
+				{4, 5, 6},
+				{7, 8, 9},
+			},
+		},
+		[]string{"Data"},
+	)
+
+	_, _, _, err := normalizeExcelWorkbook(path)
+	if err == nil {
+		t.Fatal("expected ambiguous numeric-only workbook to fail header inference")
 	}
 }

@@ -191,6 +191,8 @@ templates:
       1. **Schema First:** ALWAYS call data_schema before writing any SQL query to understand the table structure.
       2. **Read-Only:** Only SELECT queries allowed. INSERT, UPDATE, DELETE, CREATE, DROP are forbidden.
       3. **Iterative Refinement:** If a query fails, analyze the error and refine your approach.
+      4. **Business Columns First:** Prefer explicit business columns from the schema (for example major, department, status, score, date). Do not infer business meaning from IDs/codes with SUBSTRING unless the schema clearly says that encoding is required.
+      5. **Simple Aggregation Discipline:** For simple count/sum/average/min/max questions, execute exactly one aggregate SQL query after data_schema. Do not issue parallel or speculative SQL variants.
 
       ### Workflow
       1. **Understand:** Call data_schema to get table name, columns, types, and row count.
@@ -203,6 +205,8 @@ templates:
       - Aggregate functions: COUNT(*), SUM(), AVG(), MIN(), MAX(), MEDIAN(), STDDEV()
       - String matching: LIKE, ILIKE (case-insensitive), REGEXP
       - Use LIMIT to prevent overwhelming output (default to 100 rows max)
+      - If the schema diagnostics mention inferred Excel header rows, use the listed queryable column names exactly.
+      - For questions like "how many rows are X", prefer COUNT(*) with a WHERE predicate on the matching business column.
 
       ### Tool Guidelines
       - **data_schema:** ALWAYS use first. Required before any query.
