@@ -14,7 +14,7 @@ import (
 // validIMPlatforms is the set of supported IM platforms.
 var validIMPlatforms = map[string]bool{
 	"wecom": true, "feishu": true, "slack": true, "telegram": true, "dingtalk": true, "mattermost": true,
-	"wechat": true, "qqbot": true,
+	"wechat": true, "wechat_mp": true, "qqbot": true,
 }
 
 // IMHandler handles IM platform callback requests and channel CRUD.
@@ -60,7 +60,7 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 	}
 
 	if !validIMPlatforms[req.Platform] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "platform must be 'wecom', 'feishu', 'slack', 'telegram', 'dingtalk', 'mattermost', 'wechat' or 'qqbot'"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "platform must be 'wecom', 'feishu', 'slack', 'telegram', 'dingtalk', 'mattermost', 'wechat', 'wechat_mp' or 'qqbot'"})
 		return
 	}
 
@@ -78,22 +78,7 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 	if req.Enabled != nil {
 		channel.Enabled = *req.Enabled
 	}
-	// WeChat uses long-polling mode and full output only
-	if req.Platform == "wechat" {
-		channel.Mode = "longpoll"
-		channel.OutputMode = "full"
-	} else {
-		if channel.Mode == "" {
-			if channel.Platform == "mattermost" {
-				channel.Mode = "webhook"
-			} else {
-				channel.Mode = "websocket"
-			}
-		}
-		if channel.OutputMode == "" {
-			channel.OutputMode = "stream"
-		}
-	}
+	applyIMChannelModeDefaults(channel)
 	if channel.Credentials == nil {
 		channel.Credentials = types.JSON("{}")
 	}
@@ -392,12 +377,12 @@ func (h *IMHandler) IMCallback(c *gin.Context) {
 		} else {
 			logger.Infof(ctx, "[IM] Callback parsed no message to process platform=%s path_channel_id=%s", channel.Platform, channelID)
 		}
-		c.JSON(http.StatusOK, gin.H{"success": true})
+		writeIMCallbackAck(c, channel.Platform)
 		return
 	}
 
 	// Respond immediately to avoid platform timeout
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	writeIMCallbackAck(c, channel.Platform)
 
 	// Detach from gin request context
 	asyncCtx := context.WithoutCancel(ctx)

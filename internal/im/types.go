@@ -40,14 +40,21 @@ func (ch *IMChannel) BeforeCreate(tx *gorm.DB) error {
 		ch.ID = uuid.New().String()
 	}
 	if ch.Mode == "" {
-		if ch.Platform == "mattermost" {
+		switch ch.Platform {
+		case "mattermost", "wechat_mp":
 			ch.Mode = "webhook"
-		} else {
+		case "wechat":
+			ch.Mode = "longpoll"
+		default:
 			ch.Mode = "websocket"
 		}
 	}
 	if ch.OutputMode == "" {
-		ch.OutputMode = "stream"
+		if ch.Platform == "wechat" || ch.Platform == "wechat_mp" {
+			ch.OutputMode = "full"
+		} else {
+			ch.OutputMode = "stream"
+		}
 	}
 	if ch.SessionMode == "" {
 		ch.SessionMode = string(SessionModeUser)
@@ -139,6 +146,10 @@ func (ch *IMChannel) computeBotIdentity() string {
 	case "wechat":
 		if botID := str("ilink_bot_id"); botID != "" {
 			return "wechat:" + botID
+		}
+	case "wechat_mp":
+		if appID := str("app_id"); appID != "" {
+			return "wechat_mp:" + appID
 		}
 	case "qqbot":
 		if appID := str("app_id"); appID != "" {

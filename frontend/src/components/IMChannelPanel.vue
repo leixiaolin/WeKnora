@@ -33,7 +33,7 @@
             </div>
             <div v-if="authStore.hasRole('admin')" class="channel-card__actions" @click.stop>
               <t-dropdown trigger="click" placement="bottom-right" attach="body" :options="channelMenuOptions(channel)"
-                @click="(data) => handleChannelMenuClick(data, channel)">
+                @click="(data: { value?: string }) => handleChannelMenuClick(data, channel)">
                 <t-button variant="text" shape="square" size="small" class="channel-card__action-btn channel-card__more"
                   @click.stop>
                   <template #icon><t-icon name="ellipsis" /></template>
@@ -154,16 +154,18 @@
             <div class="option-chips">
               <button type="button" class="option-chip"
                 :class="{ 'option-chip--active': formData.mode === 'websocket' }"
-                :disabled="formData.platform === 'mattermost'" @click="formData.mode = 'websocket'">
+                :disabled="formData.platform === 'mattermost' || formData.platform === 'wechat_mp'"
+                @click="formData.mode = 'websocket'">
                 WebSocket
               </button>
               <button type="button" class="option-chip" :class="{ 'option-chip--active': formData.mode === 'webhook' }"
-                @click="formData.mode = 'webhook'">
+                :disabled="formData.platform === 'wechat_mp'" @click="formData.mode = 'webhook'">
                 Webhook
               </button>
             </div>
             <p class="form-desc">
               {{ formData.platform === 'mattermost' ? $t('agentEditor.im.mattermostModeHint') :
+                formData.platform === 'wechat_mp' ? $t('agentEditor.im.wechatMPModeHint') :
                 $t('agentEditor.im.modeHint') }}
             </p>
           </div>
@@ -173,6 +175,7 @@
             <div class="option-chips">
               <button type="button" class="option-chip"
                 :class="{ 'option-chip--active': formData.output_mode === 'stream' }"
+                :disabled="formData.platform === 'wechat_mp'"
                 @click="formData.output_mode = 'stream'">
                 {{ $t('agentEditor.im.outputStream') }}
               </button>
@@ -403,6 +406,36 @@
               </div>
             </template>
 
+            <!-- WeChat Official Account credentials -->
+            <template v-if="formData.platform === 'wechat_mp'">
+              <div class="platform-link-hint">
+                <a href="https://mp.weixin.qq.com/" target="_blank" rel="noopener noreferrer" class="doc-link">
+                  {{ $t('agentEditor.im.wechatMPConsole') }}
+                  <t-icon name="link" class="link-icon" />
+                </a>
+                <span class="hint-text">{{ $t('agentEditor.im.consoleTip') }}</span>
+              </div>
+              <p class="form-desc">{{ $t('agentEditor.im.wechatMPHint') }}</p>
+              <div class="form-item">
+                <label class="form-label required">App ID</label>
+                <t-input v-model="formData.credentials.app_id" placeholder="wx..." />
+              </div>
+              <div class="form-item">
+                <label class="form-label required">App Secret</label>
+                <t-input v-model="formData.credentials.app_secret" type="password" placeholder="App Secret" />
+              </div>
+              <div class="form-item">
+                <label class="form-label required">Token</label>
+                <t-input v-model="formData.credentials.token" placeholder="Callback Token" />
+                <p class="form-desc">{{ $t('agentEditor.im.wechatMPTokenHint') }}</p>
+              </div>
+              <div class="form-item">
+                <label class="form-label">API Base URL</label>
+                <t-input v-model="formData.credentials.api_base_url" placeholder="https://api.weixin.qq.com" />
+                <p class="form-desc">{{ $t('agentEditor.im.wechatMPAPIBaseURLHint') }}</p>
+              </div>
+            </template>
+
             <!-- QQBot credentials -->
             <template v-if="formData.platform === 'qqbot'">
               <div class="platform-link-hint">
@@ -555,6 +588,7 @@ const PLATFORM_LOGO: Record<string, string> = {
   dingtalk: dingtalkLogo,
   mattermost: mattermostLogo,
   wechat: wechatLogo,
+  wechat_mp: wechatLogo,
   qqbot: qqbotLogo,
 };
 
@@ -605,6 +639,7 @@ const platformOptions = computed(() => ([
   { value: 'dingtalk' as IMPlatform, label: t('agentEditor.im.dingtalk'), logo: dingtalkLogo },
   { value: 'mattermost' as IMPlatform, label: t('agentEditor.im.mattermost'), logo: mattermostLogo },
   { value: 'wechat' as IMPlatform, label: t('agentEditor.im.wechat'), logo: wechatLogo },
+  { value: 'wechat_mp' as IMPlatform, label: t('agentEditor.im.wechat_mp'), logo: wechatLogo },
   { value: 'qqbot' as IMPlatform, label: t('agentEditor.im.qqbot'), logo: qqbotLogo },
 ]));
 
@@ -720,6 +755,10 @@ watch(
         formData.value.credentials.post_to_main = false;
       }
     }
+    if (p === 'wechat_mp') {
+      formData.value.mode = 'webhook';
+      formData.value.output_mode = 'full';
+    }
     if (!platformSupportsThread(p)) {
       formData.value.session_mode = 'user';
     }
@@ -741,9 +780,12 @@ function onPlatformChange(val: string | number | boolean) {
   wechatQRImgUrl.value = '';
   wechatQRCode.value = '';
   wechatQRStatus.value = '';
-  // WeChat uses fixed mode/output
+  // WeChat personal account and Official Account use fixed mode/output.
   if (val === 'wechat') {
     formData.value.mode = 'longpoll';
+    formData.value.output_mode = 'full';
+  } else if (val === 'wechat_mp') {
+    formData.value.mode = 'webhook';
     formData.value.output_mode = 'full';
   } else {
     formData.value.mode = 'websocket';
@@ -889,7 +931,7 @@ async function editChannel(channel: IMChannel | IMChannelOverview) {
   if (!('credentials' in channel)) {
     try {
       const res = await listIMChannels(channel.agent_id);
-      fullChannel = (res.data || []).find((item) => item.id === channel.id) || null;
+      fullChannel = (res.data || []).find((item: IMChannel) => item.id === channel.id) || null;
     } catch {
       fullChannel = null;
     }
@@ -944,6 +986,14 @@ async function handleSave() {
     // For WeChat, validate that credentials are bound
     if (formData.value.platform === 'wechat' && !formData.value.credentials.bot_token) {
       MessagePlugin.warning(t('agentEditor.im.wechatScanBind'));
+      return;
+    }
+    if (formData.value.platform === 'wechat_mp' && (
+      !formData.value.credentials.app_id ||
+      !formData.value.credentials.app_secret ||
+      !formData.value.credentials.token
+    )) {
+      MessagePlugin.warning(t('agentEditor.im.wechatMPCredentialsRequired'));
       return;
     }
 

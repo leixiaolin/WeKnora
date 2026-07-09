@@ -71,6 +71,27 @@ func TestIMChannelBeforeCreate_SessionModeDefault(t *testing.T) {
 	}
 }
 
+func TestIMChannelBeforeCreate_WeChatMPDefaults(t *testing.T) {
+	ch := &IMChannel{
+		TenantID:    1,
+		AgentID:     "agent-1",
+		Platform:    "wechat_mp",
+		Credentials: []byte(`{"app_id":"wx123"}`),
+	}
+	if err := ch.BeforeCreate(&gorm.DB{}); err != nil {
+		t.Fatalf("BeforeCreate error: %v", err)
+	}
+	if ch.Mode != "webhook" {
+		t.Fatalf("Mode = %q, want webhook", ch.Mode)
+	}
+	if ch.OutputMode != "full" {
+		t.Fatalf("OutputMode = %q, want full", ch.OutputMode)
+	}
+	if ch.BotIdentity != "wechat_mp:wx123" {
+		t.Fatalf("BotIdentity = %q, want wechat_mp:wx123", ch.BotIdentity)
+	}
+}
+
 func TestIMChannelBeforeCreate_InvalidSessionMode(t *testing.T) {
 	ch := &IMChannel{
 		TenantID:    1,

@@ -1169,12 +1169,17 @@ func (s *Service) isDuplicate(ctx context.Context, messageID string) bool {
 	return loaded
 }
 
+func makeMessageDedupID(channelID, messageID string) string {
+	return channelID + ":" + messageID
+}
+
 // HandleMessage processes an incoming IM message end-to-end using channel config.
 func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, channelID string) error {
 	// Dedup: skip if this message was already processed (IM platforms may retry)
 	if msg.MessageID != "" {
-		if s.isDuplicate(ctx, msg.MessageID) {
-			logger.Infof(ctx, "[IM] Skipping duplicate message: %s", msg.MessageID)
+		dedupID := makeMessageDedupID(channelID, msg.MessageID)
+		if s.isDuplicate(ctx, dedupID) {
+			logger.Infof(ctx, "[IM] Skipping duplicate message: %s", dedupID)
 			return nil
 		}
 	}

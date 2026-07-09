@@ -4,6 +4,16 @@
 
 WeKnora 已有统一 IM 通道抽象（`internal/im/`）和多平台适配器，微信服务号应作为新的 IM 平台 `wechat_mp` 接入，而不是复用现有 `wechat` 平台。
 
+## 实施状态（2026-07-09）
+
+- 已完成 Phase 1 后端 MVP：新增 `internal/im/wechat_mp`，并完成平台常量、handler、container、bot identity、去重 key 和测试接入。
+- 已完成 Phase 2 可视化配置与用户文档：前端 IM 渠道面板支持「微信服务号」，并补充 `docs/IM集成开发文档.md`。
+- 已验证：`go test ./internal/im/wechat_mp ./internal/im ./internal/handler/...` 通过。
+- 已验证：`cd frontend && npm run build-only` 通过。
+- 未完全验证：`cd frontend && npm run type-check` 仍失败，原因是前端全仓既有类型错误；本轮相关 `IMChannelPanel.vue` 错误已消除。
+- 未完全验证：`go build ./cmd/server` 和 `go test ./internal/container` 在当前机器缺少 `sqlite3.h`，`sqlite-vec` CGO 编译失败；需安装 SQLite 开发头文件后重跑。
+- 未实施：加密模式、多媒体消息和真实微信测试号联调。
+
 原因：
 
 - `wechat` 当前代表微信个人号 iLink Bot 长轮询适配器，凭证、收发协议、运行模式都不同。

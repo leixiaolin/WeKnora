@@ -18,6 +18,7 @@ const (
 	PlatformDingtalk   Platform = "dingtalk"
 	PlatformMattermost Platform = "mattermost"
 	PlatformWeChat     Platform = "wechat"
+	PlatformWeChatMP   Platform = "wechat_mp"
 	PlatformQQBot      Platform = "qqbot"
 )
 
